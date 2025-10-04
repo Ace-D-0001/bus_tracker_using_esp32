@@ -1,0 +1,215 @@
+/*
+  Smart Bus Tracking System using ESP32 and Firebase
+  --------------------------------------------------
+  This project tracks a bus in real time using an ESP32 and a GPS module.
+  The device sends live coordinates, speed, and direction to Firebase 
+  Realtime Database, where a hosted web app displays the bus location 
+  on an interactive map.
+
+  Instructions:
+  1. Install the following libraries in Arduino IDE:
+     - WiFi.h
+     - HTTPClient.h
+     - ArduinoJson.h
+     - TinyGPS++.h
+  2. Connect your GPS module to ESP32 UART pins (default RX=17, TX=16).
+  3. Connect built-in LED pin for WiFi status (default pin 2).
+  4. Fill in your WiFi credentials and Firebase URL below.
+  5. Upload the code to your ESP32.
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// ====== WiFi Credentials ======
+const char* ssid = "<YOUR_WIFI_SSID>";          // Replace with your WiFi SSID
+const char* password = "<YOUR_WIFI_PASSWORD>";  // Replace with your WiFi password
+
+// ====== Firebase Configuration ======
+const char* firebaseURL = "<YOUR_FIREBASE_DB_URL>"; 
+// Example: "https://your-project-id.firebaseio.com/bus_tracking/bus_32_tracker.json"
+
+// ====== Pin Definitions ======
+#define GPS_RX_PIN 17
+#define GPS_TX_PIN 16
+#define LED_PIN 2
+#define GPS_BAUD 9600
+
+// ====== GPS Setup ======
+HardwareSerial SerialGPS(2);
+TinyGPSPlus gps;
+
+// ====== Variables ======
+float currentLat = 0.0;
+float currentLng = 0.0;
+float currentSpeed = 0.0;
+bool isOperating = true;
+bool gpsFixed = false;
+String routeDirection = "to_iubat";
+
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastLEDBlink = 0;
+const unsigned long FIREBASE_UPDATE_INTERVAL = 15000; 
+const unsigned long LED_BLINK_INTERVAL = 500;         
+
+// ====== Location History Structure ======
+struct LocationHistory {
+  float lat;
+  float lng;
+  unsigned long timestamp;
+};
+
+LocationHistory locationHistory[10];
+int historyIndex = 0;
+bool historyFull = false;
+
+// ====== Helper Functions ======
+void blinkLED() {
+  static bool ledState = false;
+  unsigned long now = millis();
+  if (now - lastLEDBlink >= LED_BLINK_INTERVAL) {
+    lastLEDBlink = now;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  }
+}
+
+void setLEDStatus(bool wifiConnected) {
+  if (wifiConnected) digitalWrite(LED_PIN, HIGH);
+}
+
+float calculateDistance(float lat1, float lng1, float lat2, float lng2) {
+  const float R = 6371000;
+  float dLat = (lat2 - lat1) * PI / 180.0;
+  float dLng = (lng2 - lng1) * PI / 180.0;
+  float a = sin(dLat / 2) * sin(dLat / 2) +
+           cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
+           sin(dLng / 2) * sin(dLng / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+void updateLocationHistory(float lat, float lng) {
+  locationHistory[historyIndex].lat = lat;
+  locationHistory[historyIndex].lng = lng;
+  locationHistory[historyIndex].timestamp = millis();
+  historyIndex = (historyIndex + 1) % 10;
+  if (historyIndex == 0) historyFull = true;
+}
+
+String detectRouteDirection() {
+  if (!historyFull && historyIndex < 5) return routeDirection;
+
+  int pointsToCheck = historyFull ? 10 : historyIndex;
+  float northward = 0, southward = 0;
+
+  for (int i = 1; i < pointsToCheck; i++) {
+    int prev = (historyIndex - i - 1 + 10) % 10;
+    int curr = (historyIndex - i + 10) % 10;
+
+    if (!historyFull && (prev >= historyIndex || curr >= historyIndex)) continue;
+
+    float latDiff = locationHistory[curr].lat - locationHistory[prev].lat;
+    if (abs(latDiff) > 0.001) {
+      if (latDiff > 0) northward += latDiff;
+      else southward += abs(latDiff);
+    }
+  }
+
+  if (northward > southward * 1.5) return "to_iubat";
+  else if (southward > northward * 1.5) return "to_motijheel";
+  return routeDirection;
+}
+
+String formatTimestamp() {
+  unsigned long now = millis() / 1000;
+  int hours = (now / 3600) % 24;
+  int minutes = (now / 60) % 60;
+  int seconds = now % 60;
+  char timestamp[30];
+  sprintf(timestamp, "2025-09-26 %02d:%02d:%02d", hours, minutes, seconds);
+  return String(timestamp);
+}
+
+bool sendToFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.begin(firebaseURL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  DynamicJsonDocument doc(1024);
+  doc["isOperating"] = isOperating;
+
+  JsonObject location = doc.createNestedObject("location");
+  location["lat"] = currentLat;
+  location["lng"] = currentLng;
+
+  doc["speed_kmh"] = currentSpeed;
+  doc["routeDirection"] = routeDirection;
+  doc["timestamp"] = formatTimestamp();
+  doc["gpsFixed"] = gpsFixed;
+  doc["satellites"] = gps.satellites.value();
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  int httpResponseCode = http.PUT(jsonString);
+  http.end();
+  return (httpResponseCode > 0);
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    blinkLED();
+    delay(100);
+  }
+  setLEDStatus(true);
+}
+
+// ====== Setup ======
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  connectToWiFi();
+  SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  for (int i = 0; i < 10; i++) locationHistory[i] = {0.0, 0.0, 0};
+}
+
+// ====== Loop ======
+void loop() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    blinkLED();
+    WiFi.reconnect();
+    delay(1000);
+  } else setLEDStatus(true);
+
+  while (SerialGPS.available() > 0) {
+    char c = SerialGPS.read();
+    if (gps.encode(c) && gps.location.isUpdated() && gps.location.isValid()) {
+      currentLat = gps.location.lat();
+      currentLng = gps.location.lng();
+      currentSpeed = gps.speed.kmph();
+      gpsFixed = true;
+      updateLocationHistory(currentLat, currentLng);
+      routeDirection = detectRouteDirection();
+    }
+  }
+
+  if (gps.location.age() > 5000) gpsFixed = false;
+
+  if (now - lastFirebaseUpdate >= FIREBASE_UPDATE_INTERVAL) {
+    lastFirebaseUpdate = now;
+    if (gpsFixed && currentLat != 0.0 && currentLng != 0.0) sendToFirebase();
+  }
+
+  delay(100);
+}
